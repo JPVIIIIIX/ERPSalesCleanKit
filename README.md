@@ -1,11 +1,11 @@
-# ERP 销售订单清洗 Skill
+# ERPSalesCleanKit · ERP 销售订单清洗 Skill
 
 把中文 ERP 销售明细拆成财年表。识别精确重复，保留原字段和明细金额，通过飞书渠道子表联动显示两个渠道结果。仓库提供脚本和使用说明，使用者自备 ERP 导出和飞书权限。
 
 ## 获取
 
 ```sh
-git clone https://github.com/JPVIIIIIX/erp-sales-clean-skill.git
+git clone https://github.com/JPVIIIIIX/ERPSalesCleanKit.git erp-sales-clean-skill
 cd erp-sales-clean-skill
 python3 -m pip install -r requirements.txt
 ```

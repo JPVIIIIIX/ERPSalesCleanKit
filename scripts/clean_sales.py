@@ -30,11 +30,16 @@ TRADE = '含税金额（交易货币）'
 GROUP = '集团货币含税金额'
 CHANNEL = ('渠道大类', '渠道子来源')
 DETAIL_CHANNEL = ('客户来源（映射）', '客户子来源')
+MATERIAL_SCHEME = '解决方案'
+MATERIAL_CODE = '物料编码'
+MATERIAL_MAP_KEY = '完整物料编码'
+MATERIAL_MAP_VALUE = '归属方案'
+MATERIAL_MAP_NAMES = ('解决方案映射表', '物料方案映射表')
 SELECT_FIELDS = {FY, *CHANNEL}
 MAP_TABLE = '渠道映射表'
 MAP_SOURCE = 'ERP客户来源'
 MAP_FIELDS = (MAP_SOURCE, *CHANNEL)
-DETAIL_VISIBLE = (ORDER, '销售订单行号', '客户简称', '城市', *DETAIL_CHANNEL, '业务员', '销售组', '物料编码', '物料名称', '物料大类', '物料分类', '数量', '单位', TRADE, '交易货币', GROUP, '集团货币', '客户建档日期')
+DETAIL_VISIBLE = (ORDER, '销售订单行号', '客户简称', '城市', *DETAIL_CHANNEL, '业务员', '销售组', '物料编码', '物料名称', '物料大类', '物料分类', MATERIAL_SCHEME, '数量', '单位', TRADE, '交易货币', GROUP, '集团货币', '客户建档日期')
 
 
 def encode(value):
@@ -79,6 +84,54 @@ def ensure_channel_formulas(base, table):
         actual = cli('field-get', *args, '--field-id', name)['field']
         if actual.get('expression') != definition['expression']:
             raise ValueError(f'{table} 的「{name}」映射公式与规则约定不一致')
+
+
+def material_scheme_formula(table):
+    match = (f'[{table}].FILTER(UPPER(TRIM(CurrentValue.[{MATERIAL_MAP_KEY}]))'
+             f'=UPPER(TRIM([{MATERIAL_CODE}])))')
+    result = f'{match}.[{MATERIAL_MAP_VALUE}].ARRAYJOIN("")'
+    expression = (f'IF(ISBLANK([{MATERIAL_CODE}]),"待确认",'
+                  f'IF({match}.[{MATERIAL_MAP_KEY}].COUNTA()=1,'
+                  f'IF(ISBLANK({result}),"待确认",{result}),"待确认"))')
+    return {'name': MATERIAL_SCHEME, 'type': 'formula', 'expression': expression}
+
+
+def material_scheme_counts(base, table, detail):
+    counts, schemes = Counter(), {}
+    args = ('--base-token', base, '--table-id', table['id'])
+    offset = 0
+    while True:
+        page = cli('record-list', *args, '--format', 'json', '--limit', '200',
+                   '--offset', str(offset), '--field-id', MATERIAL_MAP_KEY,
+                   '--field-id', MATERIAL_MAP_VALUE)
+        if page['fields'] != [MATERIAL_MAP_KEY, MATERIAL_MAP_VALUE]:
+            raise ValueError('物料方案映射字段回读不一致')
+        for code, scheme in page['data']:
+            key = str(code or '').strip().upper()
+            counts[key] += 1
+            schemes[key] = select_value(scheme) or '待确认'
+        if not page['has_more']:
+            break
+        if not page['data']:
+            raise ValueError('物料方案映射表分页异常')
+        offset += len(page['data'])
+
+    def resolve(row):
+        key = str(row.get(MATERIAL_CODE) or '').strip().upper()
+        return schemes[key] if key and counts[key] == 1 else '待确认'
+
+    return {fy: Counter(resolve(row) for row in rows) for fy, rows in detail.items()}
+
+
+def ensure_material_scheme_formula(base, table, mapping_table):
+    args = ('--base-token', base, '--table-id', table)
+    definition = material_scheme_formula(mapping_table)
+    fields = {f['name']: f for f in cli('field-list', *args)['fields']}
+    if MATERIAL_SCHEME not in fields:
+        cli('field-create', *args, '--json', encode(definition), '--i-have-read-guide')
+    actual = cli('field-get', *args, '--field-id', MATERIAL_SCHEME)['field']
+    if actual['type'] != 'formula' or actual.get('expression') != definition['expression']:
+        raise ValueError(f'{table} 的「解决方案」字段与物料映射规则不一致')
 
 
 def clean_cell(name, value):
@@ -432,10 +485,18 @@ def main():
     print(encode({'财年明细': {k: len(v) for k, v in detail.items()},
                   '抵消': offset_audit, '清洗': quality, '未映射来源种类': len(unmapped),
                   '渠道明细': Counter(r['渠道大类'] for rows in detail.values() for r in rows)}), flush=True)
+    material_tables = [t for t in tables if t['name'] in MATERIAL_MAP_NAMES]
+    if len(material_tables) > 1:
+        raise ValueError('检测到两张物料方案映射表，请确认唯一规则来源')
+    material_mapping = material_tables[0] if material_tables and MATERIAL_CODE in columns else None
+    if material_mapping:
+        if MATERIAL_SCHEME in columns:
+            raise ValueError('ERP 源表已有「解决方案」字段，请先确认如何保留源字段')
+        print(encode({'物料方案明细': material_scheme_counts(base, material_mapping, detail)}), flush=True)
     if not args.base:
         return
     storage = (ORDER, KEY, FY, *(n for n in columns if n != ORDER))
-    names = (*storage, *DETAIL_CHANNEL)
+    names = (*storage, *DETAIL_CHANNEL, *((MATERIAL_SCHEME,) if material_mapping else ()))
     options = {FY: set(detail)}
     visible = tuple(n for n in DETAIL_VISIBLE if n in names)
     jobs = [(base, fiscal, rows, names, (KEY, FY), visible)
@@ -443,6 +504,8 @@ def main():
     for fiscal in detail:
         ensure_schema(base, fiscal, storage, options)
         ensure_channel_formulas(base, fiscal)
+        if material_mapping:
+            ensure_material_scheme_formula(base, fiscal, material_mapping['name'])
     with ThreadPoolExecutor(max_workers=3) as pool:
         for _ in pool.map(lambda job: sync_table(*job), jobs):
             pass

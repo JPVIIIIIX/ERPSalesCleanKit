@@ -40,6 +40,8 @@ MATERIAL_MAJOR = '物料大类'
 MATERIAL_CATEGORY = '物料分类'
 MATERIAL_MAP_CATEGORY = 'ERP物料分类'
 MATERIAL_DEFAULT = '分类规则'
+MATERIAL_SERIES = '系列规则'
+MATERIAL_MODEL = '母型号'
 MATERIAL_EXCEPTION = '编码例外'
 PENDING_SCHEME = '待确认'
 MATERIAL_MAP_NAMES = ('解决方案映射表', '物料方案映射表')
@@ -111,7 +113,7 @@ def legacy_material_scheme_formula(table):
     return {'name': MATERIAL_SCHEME, 'type': 'formula', 'expression': expression}
 
 
-def material_scheme_formula(table, classification_rules=True):
+def material_scheme_formula(table, classification_rules=True, series_rules=False):
     if not classification_rules:
         return legacy_material_scheme_formula(table)
 
@@ -131,26 +133,38 @@ def material_scheme_formula(table, classification_rules=True):
                           f'TRIM(CurrentValue.[{MATERIAL_MAP_CATEGORY}])=TRIM([{MATERIAL_CATEGORY}])')
     fallback = (f'IF(OR(ISBLANK([{MATERIAL_MAJOR}]),ISBLANK([{MATERIAL_CATEGORY}])),'
                 f'"{PENDING_SCHEME}",{result(by_category, MATERIAL_MAP_CATEGORY)})')
+    if series_rules:
+        model = f'UPPER(TRIM(CurrentValue.[{MATERIAL_MODEL}]))'
+        code = f'UPPER(TRIM([{MATERIAL_CODE}]))'
+        by_model = matched(MATERIAL_SERIES,
+                           f'TRIM(CurrentValue.[{MATERIAL_MAJOR}])=TRIM([{MATERIAL_MAJOR}]),'
+                           f'TRIM(CurrentValue.[{MATERIAL_MAP_CATEGORY}])=TRIM([{MATERIAL_CATEGORY}]),'
+                           f'OR({code}={model},LEFT({code},LEN({model})+1)=({model}&"."))')
+        fallback = (f'IF({by_model}.[{MATERIAL_MODEL}].COUNTA()>0,'
+                    f'{result(by_model, MATERIAL_MODEL)},{fallback})')
     expression = (f'IF({by_code}.[{MATERIAL_MAP_KEY}].COUNTA()>0,'
                   f'{result(by_code, MATERIAL_MAP_KEY)},{fallback})')
     return {'name': MATERIAL_SCHEME, 'type': 'formula', 'expression': expression}
 
 
-def material_uses_classification(base, table):
+def material_rule_mode(base, table):
     args = ('--base-token', base, '--table-id', table['id'])
     names = {f['name'] for f in cli('field-list', *args)['fields']}
     required = {MATERIAL_RULE_TYPE, MATERIAL_MAJOR}
-    if names & required and not required <= names:
+    if names & (required | {MATERIAL_MODEL}) and not required <= names:
         raise ValueError('物料映射表的分类规则字段不完整')
-    return required <= names
+    return required <= names, MATERIAL_MODEL in names
 
 
-def material_scheme_counts(base, table, detail, classification_rules):
-    exceptions, defaults = {}, {}
+def material_scheme_counts(base, table, detail, classification_rules, series_rules=False):
+    exceptions, series, defaults = {}, {}, {}
     args = ('--base-token', base, '--table-id', table['id'])
     columns = [MATERIAL_MAP_KEY, MATERIAL_MAP_VALUE]
     if classification_rules:
         columns += [MATERIAL_RULE_TYPE, MATERIAL_MAJOR, MATERIAL_MAP_CATEGORY]
+
+    if series_rules:
+        columns.append(MATERIAL_MODEL)
 
     def add(rules, key, scheme):
         rules[key] = PENDING_SCHEME if key in rules else select_value(scheme) or PENDING_SCHEME
@@ -170,11 +184,14 @@ def material_scheme_counts(base, table, detail, classification_rules):
                 if key:
                     add(exceptions, key, scheme)
                 continue
-            kind, major, category = classification
+            kind, major, category, *model = classification
+            category_key = (trim(major), trim(category))
             if kind == MATERIAL_EXCEPTION and key:
                 add(exceptions, key, scheme)
-            elif kind == MATERIAL_DEFAULT and trim(major) and trim(category):
-                add(defaults, (trim(major), trim(category)), scheme)
+            elif kind == MATERIAL_DEFAULT and all(category_key):
+                add(defaults, category_key, scheme)
+            elif kind == MATERIAL_SERIES and model and trim(model[0]) and all(category_key):
+                add(series, (*category_key, trim(model[0]).upper()), scheme)
         if not page['has_more']:
             break
         if not page['data']:
@@ -184,14 +201,15 @@ def material_scheme_counts(base, table, detail, classification_rules):
     def resolve(row):
         code = trim(row.get(MATERIAL_CODE)).upper()
         category = (trim(row.get(MATERIAL_MAJOR)), trim(row.get(MATERIAL_CATEGORY)))
-        return exceptions.get(code, defaults.get(category, PENDING_SCHEME))
+        model = '.'.join(code.split('.')[:2])
+        return exceptions.get(code, series.get((*category, model), defaults.get(category, PENDING_SCHEME)))
 
     return {fy: Counter(resolve(row) for row in rows) for fy, rows in detail.items()}
 
 
-def ensure_material_scheme_formula(base, table, mapping_table, classification_rules):
+def ensure_material_scheme_formula(base, table, mapping_table, classification_rules, series_rules=False):
     args = ('--base-token', base, '--table-id', table)
-    definition = material_scheme_formula(mapping_table, classification_rules)
+    definition = material_scheme_formula(mapping_table, classification_rules, series_rules)
     fields = {f['name']: f for f in cli('field-list', *args)['fields']}
     if MATERIAL_SCHEME not in fields:
         cli('field-create', *args, '--json', encode(definition), '--i-have-read-guide')
@@ -555,12 +573,12 @@ def main():
     if len(material_tables) > 1:
         raise ValueError('检测到两张物料方案映射表，请确认唯一规则来源')
     material_mapping = material_tables[0] if material_tables and MATERIAL_CODE in columns else None
-    classification_rules = False
+    classification_rules, series_rules = False, False
     if material_mapping:
-        classification_rules = material_uses_classification(base, material_mapping)
+        classification_rules, series_rules = material_rule_mode(base, material_mapping)
         if MATERIAL_SCHEME in columns:
             raise ValueError('ERP 源表已有「解决方案」字段，请先确认如何保留源字段')
-        print(encode({'物料方案明细': material_scheme_counts(base, material_mapping, detail, classification_rules)}), flush=True)
+        print(encode({'物料方案明细': material_scheme_counts(base, material_mapping, detail, classification_rules, series_rules)}), flush=True)
     if not args.base:
         return
     storage = (ORDER, KEY, FY, *(n for n in columns if n != ORDER))
@@ -571,7 +589,7 @@ def main():
         ensure_schema(base, fiscal, storage, options)
         channel_names = ensure_channel_formulas(base, fiscal, columns)
         if material_mapping:
-            ensure_material_scheme_formula(base, fiscal, material_mapping['name'], classification_rules)
+            ensure_material_scheme_formula(base, fiscal, material_mapping['name'], classification_rules, series_rules)
         names = (*storage, *channel_names, *scheme_fields)
         channel_headers = dict(zip(DETAIL_CHANNEL, channel_names))
         visible = tuple(channel_headers.get(n, n) for n in DETAIL_VISIBLE

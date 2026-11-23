@@ -30,6 +30,7 @@ TRADE = '含税金额（交易货币）'
 GROUP = '集团货币含税金额'
 CHANNEL = ('渠道大类', '渠道子来源')
 DETAIL_CHANNEL = ('客户来源（映射）', '客户子来源')
+DETAIL_CHANNEL_ALIASES = ('客户渠道', '客户子渠道')
 MATERIAL_SCHEME = '解决方案'
 MATERIAL_CODE = '物料编码'
 MATERIAL_MAP_KEY = '完整物料编码'
@@ -71,10 +72,16 @@ def channel_formula(name, source, index):
     return {'name': name, 'type': 'formula', 'expression': expr}
 
 
-def ensure_channel_formulas(base, table):
+def ensure_channel_formulas(base, table, source_fields=()):
     args = ('--base-token', base, '--table-id', table)
     fields = {f['name']: f for f in cli('field-list', *args)['fields']}
-    for i, name in enumerate(DETAIL_CHANNEL):
+    names = []
+    for i, (default, alias) in enumerate(zip(DETAIL_CHANNEL, DETAIL_CHANNEL_ALIASES)):
+        existing_alias = alias in fields and alias not in source_fields
+        if default in fields and existing_alias:
+            raise ValueError(f'{table} 同时存在「{default}」与「{alias}」，请先确认渠道映射列')
+        name = alias if existing_alias else default
+        names.append(name)
         definition = channel_formula(name, CHANNEL[i], i)
         field = fields.get(name)
         if not field:
@@ -84,6 +91,7 @@ def ensure_channel_formulas(base, table):
         actual = cli('field-get', *args, '--field-id', name)['field']
         if actual.get('expression') != definition['expression']:
             raise ValueError(f'{table} 的「{name}」映射公式与规则约定不一致')
+    return tuple(names)
 
 
 def material_scheme_formula(table):
@@ -496,16 +504,19 @@ def main():
     if not args.base:
         return
     storage = (ORDER, KEY, FY, *(n for n in columns if n != ORDER))
-    names = (*storage, *DETAIL_CHANNEL, *((MATERIAL_SCHEME,) if material_mapping else ()))
+    scheme_fields = (MATERIAL_SCHEME,) if material_mapping else ()
     options = {FY: set(detail)}
-    visible = tuple(n for n in DETAIL_VISIBLE if n in names)
-    jobs = [(base, fiscal, rows, names, (KEY, FY), visible)
-            for fiscal, rows in detail.items()]
-    for fiscal in detail:
+    jobs = []
+    for fiscal, rows in detail.items():
         ensure_schema(base, fiscal, storage, options)
-        ensure_channel_formulas(base, fiscal)
+        channel_names = ensure_channel_formulas(base, fiscal, columns)
         if material_mapping:
             ensure_material_scheme_formula(base, fiscal, material_mapping['name'])
+        names = (*storage, *channel_names, *scheme_fields)
+        channel_headers = dict(zip(DETAIL_CHANNEL, channel_names))
+        visible = tuple(channel_headers.get(n, n) for n in DETAIL_VISIBLE
+                        if channel_headers.get(n, n) in names)
+        jobs.append((base, fiscal, rows, names, (KEY, FY), visible))
     with ThreadPoolExecutor(max_workers=3) as pool:
         for _ in pool.map(lambda job: sync_table(*job), jobs):
             pass

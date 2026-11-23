@@ -31,6 +31,8 @@ python3 scripts/clean_sales.py "/path/orders.xlsx" --base "YOUR_BASE_TOKEN"
 
 如已核实业务系统的冲销语义，可选用 `--reversal-column "调整标记" --reversal-value "冲销"`。这两个名称只是示例。启用时需要客户编号、物料编码、单位、集团及交易币种、两种含税金额和数量。先只读核查排除范围，再写飞书。
 
+三个财年的渠道和解决方案字段可以显示为单选标签。字段类型保留「公式」，在飞书界面将「字段格式」设为「单选」。按 [Skill 操作说明](SKILL.md#飞书公式的单选显示) 逐财年检查。
+
 ## 版本管理
 
 - 日常开发跟随 `main`。部署或复跑历史数据时，使用 [Releases](https://github.com/JPVIIIIIX/ERPSalesCleanKit/releases) 的固定版本。

@@ -156,7 +156,7 @@ def material_rule_mode(base, table):
     return required <= names, MATERIAL_MODEL in names
 
 
-def material_scheme_counts(base, table, detail, classification_rules, series_rules=False):
+def material_scheme_counts(base, table, detail, classification_rules, series_rules=False, *, audit=None):
     exceptions, series, defaults = {}, {}, {}
     args = ('--base-token', base, '--table-id', table['id'])
     columns = [MATERIAL_MAP_KEY, MATERIAL_MAP_VALUE]
@@ -166,7 +166,11 @@ def material_scheme_counts(base, table, detail, classification_rules, series_rul
     if series_rules:
         columns.append(MATERIAL_MODEL)
 
+    duplicates = defaultdict(set)
+
     def add(rules, key, scheme):
+        if key in rules:
+            duplicates[id(rules)].add(key)
         rules[key] = PENDING_SCHEME if key in rules else select_value(scheme) or PENDING_SCHEME
 
     def trim(value):
@@ -204,7 +208,22 @@ def material_scheme_counts(base, table, detail, classification_rules, series_rul
         model = '.'.join(code.split('.')[:2])
         return exceptions.get(code, series.get((*category, model), defaults.get(category, PENDING_SCHEME)))
 
-    return {fy: Counter(resolve(row) for row in rows) for fy, rows in detail.items()}
+    counts = {}
+    for fiscal, rows in detail.items():
+        counts[fiscal] = Counter()
+        pending = Counter()
+        for row in rows:
+            scheme = resolve(row)
+            counts[fiscal][scheme] += 1
+            if scheme == PENDING_SCHEME:
+                pending[trim(row.get(MATERIAL_CODE)).upper() or '<空>'] += 1
+        if audit is not None:
+            audit['未匹配物料'][fiscal] = dict(sorted(pending.items()))
+    if audit is not None:
+        for label, rules in ((MATERIAL_EXCEPTION, exceptions), (MATERIAL_SERIES, series),
+                             (MATERIAL_DEFAULT, defaults)):
+            audit['重复规则'][label] = sorted(duplicates[id(rules)])
+    return counts
 
 
 def ensure_material_scheme_formula(base, table, mapping_table, classification_rules, series_rules=False):
@@ -414,7 +433,7 @@ def writable_cells(values):
             for name, value in values.items()}
 
 
-def read_remote(args, names, expected_count):
+def read_remote(args, names, expected_count, *, key_by_record_id=False):
     records = {}
     selectors = [arg for name in names for arg in ('--field-id', name)]
     offset = 0
@@ -423,7 +442,8 @@ def read_remote(args, names, expected_count):
                    '--offset', str(offset), *selectors)
         assert page['fields'] == list(names), page['fields']
         for record_id, row in zip(page['record_id_list'], page['data'], strict=True):
-            if row[0] is None or row[0] in records:
+            identity = record_id if key_by_record_id else row[0]
+            if identity is None or identity in records:
                 raise ValueError(f'飞书表存在空白或重复的行标识：{args[-1]}')
             cells = dict(zip(names, row, strict=True))
             for name in DATES.intersection(cells):
@@ -431,7 +451,7 @@ def read_remote(args, names, expected_count):
                     cells[name] = cells[name][:19].replace('T', ' ')
             for name in SELECT_FIELDS.intersection(cells):
                 cells[name] = select_value(cells[name])
-            records[row[0]] = (record_id, cells)
+            records[identity] = (record_id, cells)
         offset += len(page['data'])
         if not page['has_more']:
             return records
@@ -537,6 +557,28 @@ def set_views(args, names, visible):
         raise ValueError(f'订单分组核对失败：{args[-1]} / {view} / {configured}')
 
 
+def audit_formula_display(base, table, channels):
+    args = ('--base-token', base, '--table-id', table['id'])
+    fields = {f['name']: f['type'] for f in cli('field-list', *args)['fields']}
+    outputs = tuple(name for name in (*DETAIL_CHANNEL, *DETAIL_CHANNEL_ALIASES, MATERIAL_SCHEME)
+                    if fields.get(name) == 'formula')
+    blank = {name: [] for name in outputs}
+    if not outputs:
+        return {}
+    names = (*outputs, *((SOURCE,) if SOURCE in fields else ()))
+    records = read_remote(args, names, table['records_count'], key_by_record_id=True)
+    channel_positions = {name: index for pair in (DETAIL_CHANNEL, DETAIL_CHANNEL_ALIASES)
+                         for index, name in enumerate(pair)}
+    for record_id, row in records.values():
+        expected = channels.get(channel_key(row.get(SOURCE)), ('', ''))
+        for name in outputs:
+            if row[name] and str(row[name]).strip():
+                continue
+            if name == MATERIAL_SCHEME or expected[channel_positions[name]]:
+                blank[name].append(record_id)
+    return {name: {'行数': len(ids), '记录ID': sorted(ids)} for name, ids in blank.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(description='按客户建档财年清洗 ERP 销售订单明细')
     parser.add_argument('xlsx', type=Path)
@@ -557,8 +599,11 @@ def main():
     mapping_table = next((t for t in tables if t['name'] == MAP_TABLE), None)
     if not mapping_table:
         raise ValueError('目标 Base 缺少「渠道映射表」，请使用已有唯一映射规则的 Base')
-    mapping = read_remote(mapping_args, MAP_FIELDS, mapping_table['records_count'])
-    detail, quality, unmapped = details(rows, columns, channel_index([r[1] for r in mapping.values()]),
+    mapping = read_remote(mapping_args, MAP_FIELDS, mapping_table['records_count'],
+                          key_by_record_id=bool(args.mapping_base))
+    channel_rows = [r[1] for r in mapping.values()]
+    channels = channel_index(channel_rows)
+    detail, quality, unmapped = details(rows, columns, channels,
                                        args.company_column, args.fiscal_start_month)
     offset_audit = {}
     if args.reversal_column:
@@ -574,12 +619,31 @@ def main():
         raise ValueError('检测到两张物料方案映射表，请确认唯一规则来源')
     material_mapping = material_tables[0] if material_tables and MATERIAL_CODE in columns else None
     classification_rules, series_rules = False, False
+    audit = None
+    if args.mapping_base:
+        channel_counts = Counter(channel_key(r[MAP_SOURCE]) for r in channel_rows)
+        audit = {
+            '物料映射已检查': bool(material_mapping),
+            '未匹配物料': {},
+            '渠道原值为空': {
+                fy: sum(not channel_key(r[SOURCE]) for r in fy_rows)
+                for fy, fy_rows in detail.items()
+            },
+            '重复规则': {MAP_TABLE: sorted(key for key, count in channel_counts.items() if count > 1)},
+            '已有订单明细公式显示为空': {},
+        }
     if material_mapping:
         classification_rules, series_rules = material_rule_mode(base, material_mapping)
         if MATERIAL_SCHEME in columns:
             raise ValueError('ERP 源表已有「解决方案」字段，请先确认如何保留源字段')
-        print(encode({'物料方案明细': material_scheme_counts(base, material_mapping, detail, classification_rules, series_rules)}), flush=True)
-    if not args.base:
+        print(encode({'物料方案明细': material_scheme_counts(base, material_mapping, detail, classification_rules, series_rules, audit=audit)}), flush=True)
+    if audit is not None:
+        fiscal_tables = [table for table in tables if re.fullmatch(r'FY\d{2}-\d{2}', table['name'])]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            displayed = pool.map(lambda table: audit_formula_display(base, table, channels), fiscal_tables)
+            for table, result in zip(fiscal_tables, displayed, strict=True):
+                audit['已有订单明细公式显示为空'][table['name']] = result
+        print(encode({'只读异常核查': audit}), flush=True)
         return
     storage = (ORDER, KEY, FY, *(n for n in columns if n != ORDER))
     scheme_fields = (MATERIAL_SCHEME,) if material_mapping else ()

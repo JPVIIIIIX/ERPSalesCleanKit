@@ -480,7 +480,8 @@ def ensure_schema(base, table, names, options):
     args = ('--base-token', base, '--table-id', table)
     fields = schema(names, options)
     tables = cli('table-list', '--base-token', base)['tables']
-    if not any(item['name'] == table for item in tables):
+    created = not any(item['name'] == table for item in tables)
+    if created:
         cli('table-create', '--base-token', base, '--name', table, '--fields', encode(fields))
     current = {f['name']: f['type'] for f in cli('field-list', *args)['fields']}
     missing = [f for f in fields if f['name'] not in current]
@@ -493,9 +494,10 @@ def ensure_schema(base, table, names, options):
         present = {f['name'] for f in cli('field-list', *args)['fields']}
         if not set(names).issubset(present):
             raise ValueError(f'字段回读不完整：{table}')
+    return created
 
 
-def sync_table(base, table, records, names, writable, visible, identity=KEY):
+def sync_table(base, table, records, names, writable, visible, identity=KEY, *, new_table=False):
     args = ('--base-token', base, '--table-id', table)
     projected = (identity, *(n for n in writable if n != identity))
     expected = {r[identity]: r for r in records}
@@ -525,11 +527,11 @@ def sync_table(base, table, records, names, writable, visible, identity=KEY):
         if any(value != expected[key].get(name) for name, value in values.items()):
             raise ValueError(f'飞书字段核对失败：{table}')
     if visible:
-        set_views(args, names, visible)
+        set_views(args, names, visible, new_table=new_table)
     print(encode({'表': table, '回读': len(readback), '新增': len(to_create), '更新': len(to_update)}), flush=True)
 
 
-def set_views(args, names, visible):
+def set_views(args, names, visible, *, new_table=False):
     views = {v['name']: v for v in cli('view-list', *args)['views']}
     if '表格' in views and '订单明细' not in views:
         default = views.pop('表格')
@@ -540,6 +542,8 @@ def set_views(args, names, visible):
     ):
         if name not in views:
             cli('view-create', *args, '--json', encode({'name': name, 'type': 'grid'}))
+        elif not new_table:
+            continue
         current = cli('view-get-visible-fields', *args, '--view-id', name)['visible_fields']
         if tuple(n for n in current if n != KEY) != columns:
             cli('view-set-visible-fields', *args, '--view-id', name,
@@ -650,7 +654,7 @@ def main():
     options = {FY: set(detail)}
     jobs = []
     for fiscal, rows in detail.items():
-        ensure_schema(base, fiscal, storage, options)
+        new_table = ensure_schema(base, fiscal, storage, options)
         channel_names = ensure_channel_formulas(base, fiscal, columns)
         if material_mapping:
             ensure_material_scheme_formula(base, fiscal, material_mapping['name'], classification_rules, series_rules)
@@ -658,9 +662,9 @@ def main():
         channel_headers = dict(zip(DETAIL_CHANNEL, channel_names))
         visible = tuple(channel_headers.get(n, n) for n in DETAIL_VISIBLE
                         if channel_headers.get(n, n) in names)
-        jobs.append((base, fiscal, rows, names, (KEY, FY), visible))
+        jobs.append(((base, fiscal, rows, names, (KEY, FY), visible), new_table))
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for _ in pool.map(lambda job: sync_table(*job), jobs):
+        for _ in pool.map(lambda job: sync_table(*job[0], new_table=job[1]), jobs):
             pass
 
 
